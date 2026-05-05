@@ -97,6 +97,41 @@ python scripts/infer.py \
 For FVD/FID use the scripts ... once videos have been generated.
 Or evaluate_metrics_8fps
 
+### SurgWMBench 20-anchor future prediction
+
+This repository also includes a SurgWMBench adaptation path for anchor-frame future prediction. It uses the official
+manifest split files and each clip's 20 human-labeled anchor frames. The task is to condition on anchors 1-5 and predict
+anchors 6-20; evaluation reports horizons 6-10, 6-15, and 6-20 after resizing predictions back to the original
+1920x1080 target frames.
+
+Validate the data loader:
+```bash
+PYTHONPATH=src python src/tools/validate_surgwmbench_anchor_loader.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --manifest manifests/train.jsonl \
+  --num-samples 8
+```
+
+Train:
+```bash
+PYTHONPATH=src accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --val-manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --output_dir outputs/surgwmbench_anchor_i2v
+```
+
+Evaluate:
+```bash
+PYTHONPATH=src python src/inference/eval_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --checkpoint outputs/surgwmbench_anchor_i2v/checkpoint-final \
+  --output_dir outputs/surgwmbench_anchor_i2v_eval
+```
+
 ## Dataset
 
 All the data used is from [Cholec80](https://github.com/CAMMA-public/TF-Cholec80) and [CholecT50](https://github.com/CAMMA-public/cholect50).
