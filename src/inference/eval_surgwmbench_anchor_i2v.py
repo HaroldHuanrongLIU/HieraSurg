@@ -2,8 +2,11 @@ import argparse
 import json
 import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import imageio
 import numpy as np

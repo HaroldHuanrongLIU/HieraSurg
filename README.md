@@ -29,19 +29,22 @@ This repository contains the code used to train the VDMs as well as the procedur
 
 ## Installation TODO
 
-1. Clone the repository and create the virtual environment
+1. Clone the repository and create the uv environment
    ```bash
     git clone https://github.com/DiegoBiagini/HieraSurg
     cd HieraSurg
 
-    conda create --name hierasurg python=3.10
-    conda activate hierasurg
-    
-    pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu118   
+    uv sync
+    source .venv/bin/activate
    ```
-2. Install requirements
+2. The default uv environment uses Python 3.11 and installs PyTorch 2.11 / torchvision 0.26 from `pyproject.toml`.
+   If you need only the legacy pip path, use:
    ```bash
     pip install -r requirements.txt
+   ```
+3. For the automatic labeling tools, install the optional labeler dependencies and the third-party SAM2/RADIO modules described below:
+   ```bash
+    uv sync --extra labeler
    ```
 ## Usage TODO
 
@@ -106,7 +109,7 @@ anchors 6-20; evaluation reports horizons 6-10, 6-15, and 6-20 after resizing pr
 
 Validate the data loader:
 ```bash
-PYTHONPATH=src python src/tools/validate_surgwmbench_anchor_loader.py \
+uv run python src/tools/validate_surgwmbench_anchor_loader.py \
   --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
   --manifest manifests/train.jsonl \
   --num-samples 8
@@ -114,7 +117,7 @@ PYTHONPATH=src python src/tools/validate_surgwmbench_anchor_loader.py \
 
 Train:
 ```bash
-PYTHONPATH=src accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
+uv run accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
   --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
   --train-manifest manifests/train.jsonl \
   --val-manifest manifests/val.jsonl \
@@ -124,7 +127,7 @@ PYTHONPATH=src accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
 
 Evaluate:
 ```bash
-PYTHONPATH=src python src/inference/eval_surgwmbench_anchor_i2v.py \
+uv run python src/inference/eval_surgwmbench_anchor_i2v.py \
   --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
   --manifest manifests/val.jsonl \
   --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
