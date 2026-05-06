@@ -102,10 +102,11 @@ Or evaluate_metrics_8fps
 
 ### SurgWMBench 20-anchor future prediction
 
-This repository also includes a SurgWMBench adaptation path for anchor-frame future prediction. It uses the official
-manifest split files and each clip's 20 human-labeled anchor frames. The task is to condition on anchors 1-5 and predict
-anchors 6-20; evaluation reports horizons 6-10, 6-15, and 6-20 after resizing predictions back to the original
-1920x1080 target frames.
+This repository also includes a SurgWMBench adaptation path for joint anchor-frame and trajectory prediction. It uses the
+official manifest split files and each clip's 20 human-labeled anchor frames. The task is to condition on anchors 1-5
+plus their trajectory points, predict anchor images 6-20, and output a complete 20-point trajectory where points 1-5 are
+the context inputs and points 6-20 are predicted. Evaluation reports horizons 6-10, 6-15, and 6-20 after resizing images
+back to the original 1920x1080 target frames and scoring trajectories in the original pixel coordinate system.
 
 Validate the data loader:
 ```bash
@@ -122,8 +123,12 @@ uv run accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
   --train-manifest manifests/train.jsonl \
   --val-manifest manifests/val.jsonl \
   --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
-  --output_dir outputs/surgwmbench_anchor_i2v
+  --output_dir outputs/surgwmbench_anchor_i2v \
+  --trajectory_loss_weight 1.0
 ```
+
+For an image-only baseline, add `--disable_trajectory_head`; this skips trajectory-head construction, trajectory loss,
+and `trajectory_head.pt` checkpoint output.
 
 Evaluate:
 ```bash
@@ -134,6 +139,9 @@ uv run python src/inference/eval_surgwmbench_anchor_i2v.py \
   --checkpoint outputs/surgwmbench_anchor_i2v/checkpoint-final \
   --output_dir outputs/surgwmbench_anchor_i2v_eval
 ```
+
+Joint evaluation writes `metrics.json` plus `predictions.jsonl`; each prediction row includes the full 20-point
+trajectory. Add `--disable_trajectory_head` when evaluating an image-only checkpoint without `trajectory_head.pt`.
 
 ## Dataset
 

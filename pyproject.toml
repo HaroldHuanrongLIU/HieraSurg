@@ -9,7 +9,7 @@ dependencies = [
     "bitsandbytes==0.45.2",
     "blosc",
     "decord",
-    "diffusers>=0.30.3",
+    "diffusers==0.30.3",
     "gputil",
     "gradio>=4.44.0",
     "graphviz",

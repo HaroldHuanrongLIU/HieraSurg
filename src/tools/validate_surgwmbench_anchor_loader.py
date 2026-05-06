@@ -48,6 +48,9 @@ def main() -> None:
         assert batch["anchor_frames"].shape[1:] == (3, 20, args.height, args.width)
         assert batch["context_frames"].shape[1:] == (3, 5, args.height, args.width)
         assert batch["target_frames"].shape[1:] == (3, 15, args.height, args.width)
+        assert batch["anchor_coords_norm"].shape[1:] == (20, 2)
+        assert batch["context_coords_norm"].shape[1:] == (5, 2)
+        assert batch["target_coords_norm"].shape[1:] == (15, 2)
         for paths, sampled_indices, original_size in zip(
             batch["anchor_frame_paths"], batch["sampled_indices"], batch["original_size"]
         ):
@@ -62,6 +65,7 @@ def main() -> None:
                 "patient_id": batch["patient_id"][0],
                 "trajectory_id": batch["trajectory_id"][0],
                 "anchor_shape": list(batch["anchor_frames"].shape),
+                "anchor_coords_shape": list(batch["anchor_coords_norm"].shape),
                 "context_paths": batch["context_frame_paths"][0],
                 "target_paths_first_last": [
                     batch["target_frame_paths"][0][0],

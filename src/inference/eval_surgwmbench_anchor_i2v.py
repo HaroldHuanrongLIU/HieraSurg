@@ -22,15 +22,17 @@ from tqdm.auto import tqdm
 from finetune.dataset.surgwmbench_anchor_dataset import (
     SurgWMBenchAnchorDataset,
     latent_frame_count,
-    pad_anchor_video,
     surgwmbench_anchor_collate,
 )
+from finetune.trajectory_head import SurgWMBenchTrajectoryHead, trajectory_checkpoint_file
 
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate HieraSurg on SurgWMBench 20-anchor prediction.")
     parser.add_argument("--pretrained_model_name_or_path", required=True, help="Base CogVideoX/HieraSurg model path.")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint dir containing transformer/ or a transformer dir.")
+    parser.add_argument("--trajectory-checkpoint", default=None, help="Optional path to trajectory_head.pt or its parent dir.")
+    parser.add_argument("--disable_trajectory_head", action="store_true")
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--manifest", default="manifests/val.jsonl")
     parser.add_argument("--output_dir", default="outputs/surgwmbench_anchor_i2v_eval")
@@ -57,6 +59,15 @@ def transformer_checkpoint_path(checkpoint: str) -> Path:
     if (path / "transformer").is_dir():
         return path / "transformer"
     return path
+
+
+def resolve_trajectory_checkpoint(args: argparse.Namespace) -> Path:
+    if args.trajectory_checkpoint:
+        return trajectory_checkpoint_file(args.trajectory_checkpoint)
+    checkpoint = Path(args.checkpoint)
+    if checkpoint.name == "transformer":
+        checkpoint = checkpoint.parent
+    return trajectory_checkpoint_file(checkpoint)
 
 
 def prepare_rotary_positional_embeddings(
@@ -89,6 +100,22 @@ def encode_video_latents(vae: AutoencoderKLCogVideoX, video: torch.Tensor) -> to
     encoded = vae.encode(video)
     latent_dist = encoded.latent_dist if hasattr(encoded, "latent_dist") else encoded[0]
     return latent_dist.sample() * vae.config.scaling_factor
+
+
+@torch.no_grad()
+def encode_padded_context_latents(
+    vae: AutoencoderKLCogVideoX,
+    context_frames: torch.Tensor,
+    args: argparse.Namespace,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    repeat_count = args.model_num_frames - args.context_anchors
+    pad = context_frames[:, :, -1:].repeat(1, 1, repeat_count, 1, 1)
+    conditioning_video = torch.cat([context_frames, pad], dim=2).to(device=device, dtype=torch.float32)
+    context_latents = encode_video_latents(vae, conditioning_video).to(dtype=dtype).permute(0, 2, 1, 3, 4)
+    context_latent_frames = latent_frame_count(args.context_anchors, vae.config.temporal_compression_ratio)
+    return context_latents[:, :context_latent_frames]
 
 
 def decode_video_latents(vae: AutoencoderKLCogVideoX, latents: torch.Tensor) -> torch.Tensor:
@@ -260,17 +287,72 @@ def mean_or_none(values: List[Optional[float]]) -> Optional[float]:
     return float(np.mean(valid)) if valid else None
 
 
+def coords_norm_to_px(coords_norm: torch.Tensor, original_size: Tuple[int, int]) -> np.ndarray:
+    coords = coords_norm.float().cpu().numpy().copy()
+    height, width = original_size
+    coords[:, 0] *= width
+    coords[:, 1] *= height
+    return coords
+
+
+def compute_trajectory_metrics(
+    pred_coords_px: np.ndarray,
+    target_coords_px: np.ndarray,
+    pred_coords_norm: np.ndarray,
+    target_coords_norm: np.ndarray,
+    horizon: int,
+) -> Dict[str, Optional[float]]:
+    if horizon <= 0:
+        return {"ade_px": None, "fde_px": None, "ade_norm": None, "fde_norm": None}
+    pred_px = pred_coords_px[:horizon]
+    target_px = target_coords_px[:horizon]
+    pred_norm = pred_coords_norm[:horizon]
+    target_norm = target_coords_norm[:horizon]
+    distances_px = np.linalg.norm(pred_px - target_px, axis=-1)
+    distances_norm = np.linalg.norm(pred_norm - target_norm, axis=-1)
+    return {
+        "ade_px": float(distances_px.mean()),
+        "fde_px": float(distances_px[-1]),
+        "ade_norm": float(distances_norm.mean()),
+        "fde_norm": float(distances_norm[-1]),
+    }
+
+
+def make_trajectory_points(
+    sampled_indices: List[int],
+    coords_norm: np.ndarray,
+    coords_px: np.ndarray,
+    context_anchors: int,
+    future_source: str = "predicted",
+) -> List[Dict[str, Any]]:
+    points = []
+    for idx, (local_frame_idx, coord_norm, coord_px) in enumerate(zip(sampled_indices, coords_norm, coords_px)):
+        points.append(
+            {
+                "anchor_idx": idx,
+                "local_frame_idx": local_frame_idx,
+                "coord_norm": [float(coord_norm[0]), float(coord_norm[1])],
+                "coord_px": [float(coord_px[0]), float(coord_px[1])],
+                "source": "context_input" if idx < context_anchors else future_source,
+            }
+        )
+    return points
+
+
 def main() -> None:
     args = get_args()
     if args.context_anchors + args.prediction_anchors != 20:
         raise ValueError("Expected 5 context anchors plus 15 prediction anchors.")
     if args.model_num_frames < 20 or (args.model_num_frames - 1) % 4 != 0:
         raise ValueError("--model-num-frames must be >=20 and satisfy (N - 1) % 4 == 0.")
+    if any(horizon < 1 or horizon > args.prediction_anchors for horizon in args.eval_horizons):
+        raise ValueError("--eval-horizons values must be between 1 and prediction_anchors.")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.mixed_precision]
+    trajectory_enabled = not args.disable_trajectory_head
 
     dataset = SurgWMBenchAnchorDataset(
         dataset_root=args.dataset_root,
@@ -292,17 +374,27 @@ def main() -> None:
     transformer = CogVideoXTransformer3DModel.from_pretrained(transformer_checkpoint_path(args.checkpoint), torch_dtype=dtype)
     vae = AutoencoderKLCogVideoX.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", torch_dtype=torch.float32)
     scheduler = CogVideoXDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    trajectory_head = (
+        SurgWMBenchTrajectoryHead.from_checkpoint(resolve_trajectory_checkpoint(args), map_location="cpu")
+        if trajectory_enabled
+        else None
+    )
     if args.enable_slicing:
         vae.enable_slicing()
     if args.enable_tiling:
         vae.enable_tiling()
     transformer.to(device=device, dtype=dtype).eval()
     vae.to(device=device, dtype=torch.float32).eval()
+    if trajectory_head is not None:
+        trajectory_head.to(device=device, dtype=dtype).eval()
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
     lpips_model = make_lpips(device)
+    metric_names = ["psnr", "ssim", "lpips"]
+    if trajectory_enabled:
+        metric_names.extend(["ade_px", "fde_px", "ade_norm", "fde_norm"])
     metrics_by_horizon: Dict[str, Dict[str, List[Optional[float]]]] = {
-        f"horizon_{h}": {"psnr": [], "ssim": [], "lpips": []} for h in args.eval_horizons
+        f"horizon_{h}": {metric_name: [] for metric_name in metric_names} for h in args.eval_horizons
     }
     samples: List[Dict[str, Any]] = []
     saved_videos = 0
@@ -310,6 +402,12 @@ def main() -> None:
     for batch in tqdm(loader, desc="Evaluating"):
         context_frames = batch["context_frames"].to(device=device, dtype=torch.float32)
         pred_targets = generate_future_anchors(transformer, vae, scheduler, context_frames, args, device, dtype, generator)
+        pred_future_coords_norm = None
+        if trajectory_head is not None:
+            context_latents = encode_padded_context_latents(vae, context_frames, args, device, dtype)
+            context_coords_norm = batch["context_coords_norm"].to(device=device, dtype=dtype)
+            with torch.no_grad():
+                pred_future_coords_norm = trajectory_head(context_latents, context_coords_norm).float().cpu()
 
         for b in range(pred_targets.shape[0]):
             original_size = batch["original_size"][b]
@@ -333,8 +431,23 @@ def main() -> None:
                     "ssim": mean_or_none([m["ssim"] for m in frame_metrics]),
                     "lpips": mean_or_none([m["lpips"] for m in frame_metrics]),
                 }
-                sample_metrics[horizon_key] = aggregate
+                trajectory_metrics: Dict[str, Optional[float]] = {}
+                if pred_future_coords_norm is not None:
+                    pred_future_norm_np = pred_future_coords_norm[b].numpy()
+                    target_future_norm_np = batch["target_coords_norm"][b].numpy()
+                    pred_future_px = coords_norm_to_px(pred_future_coords_norm[b], original_size)
+                    target_future_px = batch["target_coords_px"][b].numpy()
+                    trajectory_metrics = compute_trajectory_metrics(
+                        pred_future_px,
+                        target_future_px,
+                        pred_future_norm_np,
+                        target_future_norm_np,
+                        horizon,
+                    )
+                sample_metrics[horizon_key] = {**aggregate, **trajectory_metrics}
                 for metric_name, value in aggregate.items():
+                    metrics_by_horizon[horizon_key][metric_name].append(value)
+                for metric_name, value in trajectory_metrics.items():
                     metrics_by_horizon[horizon_key][metric_name].append(value)
 
             if args.save_videos and saved_videos < args.max_videos:
@@ -344,16 +457,34 @@ def main() -> None:
                 save_video(target_path, target_original)
                 saved_videos += 1
 
-            samples.append(
-                {
-                    "patient_id": batch["patient_id"][b],
-                    "trajectory_id": batch["trajectory_id"][b],
-                    "difficulty": batch["difficulty"][b],
-                    "sampled_indices": batch["sampled_indices"][b],
-                    "target_frame_paths": batch["target_frame_paths"][b],
-                    "metrics": sample_metrics,
-                }
-            )
+            sample = {
+                "patient_id": batch["patient_id"][b],
+                "trajectory_id": batch["trajectory_id"][b],
+                "difficulty": batch["difficulty"][b],
+                "sampled_indices": batch["sampled_indices"][b],
+                "target_frame_paths": batch["target_frame_paths"][b],
+                "metrics": sample_metrics,
+            }
+            if pred_future_coords_norm is not None:
+                context_norm_np = batch["context_coords_norm"][b].numpy()
+                context_px_np = batch["context_coords_px"][b].numpy()
+                pred_full_norm = np.concatenate([context_norm_np, pred_future_coords_norm[b].numpy()], axis=0)
+                pred_full_px = np.concatenate(
+                    [context_px_np, coords_norm_to_px(pred_future_coords_norm[b], original_size)], axis=0
+                )
+                target_full_norm = batch["anchor_coords_norm"][b].numpy()
+                target_full_px = batch["anchor_coords_px"][b].numpy()
+                sample["predicted_trajectory"] = make_trajectory_points(
+                    batch["sampled_indices"][b], pred_full_norm, pred_full_px, args.context_anchors
+                )
+                sample["target_trajectory"] = make_trajectory_points(
+                    batch["sampled_indices"][b],
+                    target_full_norm,
+                    target_full_px,
+                    args.context_anchors,
+                    future_source="human_gt",
+                )
+            samples.append(sample)
 
     aggregate_metrics = {
         horizon: {metric: mean_or_none(values) for metric, values in metric_values.items()}
@@ -364,6 +495,8 @@ def main() -> None:
         "model": "HieraSurg anchor I2V",
         "manifest": args.manifest,
         "checkpoint": args.checkpoint,
+        "trajectory_enabled": trajectory_enabled,
+        "trajectory_checkpoint": str(resolve_trajectory_checkpoint(args)) if trajectory_enabled else None,
         "context_anchors": args.context_anchors,
         "prediction_anchors": args.prediction_anchors,
         "eval_horizons": args.eval_horizons,
@@ -376,6 +509,10 @@ def main() -> None:
     }
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
+    if trajectory_enabled:
+        with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as f:
+            for sample in samples:
+                f.write(json.dumps(sample) + "\n")
     print(json.dumps({"metrics": aggregate_metrics, "output": str(output_dir / "metrics.json")}, indent=2))
 
 

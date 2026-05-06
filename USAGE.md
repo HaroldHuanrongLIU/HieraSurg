@@ -39,11 +39,14 @@ uv run python src/tools/validate_surgwmbench_anchor_loader.py \
   --num-samples 8
 ```
 
-## Single-GPU Training
+## Joint Image + Trajectory Training
 
-This trains one model conditioned on anchors 1-5 and supervised on anchors
-6-20. Evaluation later reports horizons 6-10, 6-15, and 6-20 from the same
-checkpoint.
+Use this mode when the input contains anchors 1-5 images and their trajectory
+points. The image branch predicts anchors 6-20, and the trajectory head predicts
+future points 6-20. The saved checkpoint includes both `transformer/` and
+`trajectory_head.pt`.
+
+Single-GPU command:
 
 ```bash
 uv run accelerate launch --num_processes 1 \
@@ -59,21 +62,12 @@ uv run accelerate launch --num_processes 1 \
   --gradient_accumulation_steps 4 \
   --mixed_precision bf16 \
   --gradient_checkpointing \
+  --trajectory_loss_weight 1.0 \
   --enable_slicing \
   --enable_tiling
 ```
 
-For a quick smoke run, append:
-
-```bash
---train_limit 2 --max_train_steps 1
-```
-
-## Multi-GPU Training
-
-Use Accelerate DDP by setting `--multi_gpu` and matching `--num_processes` to
-the number of GPUs. The global batch size is `train_batch_size * num_processes *
-gradient_accumulation_steps`.
+Multi-GPU command:
 
 ```bash
 uv run accelerate launch --multi_gpu --num_processes 4 \
@@ -89,11 +83,12 @@ uv run accelerate launch --multi_gpu --num_processes 4 \
   --gradient_accumulation_steps 2 \
   --mixed_precision bf16 \
   --gradient_checkpointing \
+  --trajectory_loss_weight 1.0 \
   --enable_slicing \
   --enable_tiling
 ```
 
-Resume from the latest checkpoint in the output directory:
+Resume joint training:
 
 ```bash
 uv run accelerate launch --multi_gpu --num_processes 4 \
@@ -106,14 +101,91 @@ uv run accelerate launch --multi_gpu --num_processes 4 \
   --resume_from_checkpoint latest \
   --mixed_precision bf16 \
   --gradient_checkpointing \
+  --trajectory_loss_weight 1.0 \
   --enable_slicing \
   --enable_tiling
 ```
 
-## Evaluation
+For a quick smoke run, append:
 
-Evaluate against original-resolution target frames. The training resize is an
-internal model detail; predictions are resized back before metric computation.
+```bash
+--train_limit 2 --max_train_steps 1
+```
+
+## Image-Only Training
+
+Use this mode for an image-only baseline. It disables trajectory-head
+construction, trajectory forward/loss, and `trajectory_head.pt` checkpoint
+output. The model still uses anchors 1-5 images as context and predicts anchors
+6-20 images.
+
+Single-GPU command:
+
+```bash
+uv run accelerate launch --num_processes 1 \
+  src/finetune/train_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --val-manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --output_dir outputs/surgwmbench_anchor_i2v_image_only \
+  --height 288 \
+  --width 512 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 4 \
+  --mixed_precision bf16 \
+  --gradient_checkpointing \
+  --disable_trajectory_head \
+  --enable_slicing \
+  --enable_tiling
+```
+
+Multi-GPU command:
+
+```bash
+uv run accelerate launch --multi_gpu --num_processes 4 \
+  src/finetune/train_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --val-manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --output_dir outputs/surgwmbench_anchor_i2v_image_only_ddp \
+  --height 288 \
+  --width 512 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 2 \
+  --mixed_precision bf16 \
+  --gradient_checkpointing \
+  --disable_trajectory_head \
+  --enable_slicing \
+  --enable_tiling
+```
+
+Resume image-only training:
+
+```bash
+uv run accelerate launch --multi_gpu --num_processes 4 \
+  src/finetune/train_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --train-manifest manifests/train.jsonl \
+  --val-manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --output_dir outputs/surgwmbench_anchor_i2v_image_only_ddp \
+  --resume_from_checkpoint latest \
+  --mixed_precision bf16 \
+  --gradient_checkpointing \
+  --disable_trajectory_head \
+  --enable_slicing \
+  --enable_tiling
+```
+
+## Joint Evaluation
+
+Evaluate against original-resolution target frames and original pixel
+coordinates. The training resize is an internal model detail; image predictions
+are resized back before metric computation. The output includes `metrics.json`
+and `predictions.jsonl`; each prediction row contains a complete 20-point
+trajectory where points 1-5 are `context_input` and points 6-20 are `predicted`.
 
 ```bash
 uv run python src/inference/eval_surgwmbench_anchor_i2v.py \
@@ -125,4 +197,22 @@ uv run python src/inference/eval_surgwmbench_anchor_i2v.py \
   --eval-horizons 5 10 15 \
   --mixed_precision bf16 \
   --save-videos
+```
+
+## Image-Only Evaluation
+
+Use this command for checkpoints trained with `--disable_trajectory_head`. It
+does not require `trajectory_head.pt`, writes only `metrics.json`, and reports
+only image metrics.
+
+```bash
+uv run python src/inference/eval_surgwmbench_anchor_i2v.py \
+  --dataset-root /mnt/hdd1/neurips2026_dataset_track/SurgWMBench \
+  --manifest manifests/val.jsonl \
+  --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
+  --checkpoint outputs/surgwmbench_anchor_i2v_image_only/checkpoint-final \
+  --output_dir outputs/surgwmbench_anchor_i2v_image_only_eval \
+  --eval-horizons 5 10 15 \
+  --mixed_precision bf16 \
+  --disable_trajectory_head
 ```

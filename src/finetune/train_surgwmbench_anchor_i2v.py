@@ -10,6 +10,7 @@ from typing import Dict, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -31,6 +32,7 @@ from finetune.dataset.surgwmbench_anchor_dataset import (
     pad_anchor_video,
     surgwmbench_anchor_collate,
 )
+from finetune.trajectory_head import SurgWMBenchTrajectoryHead
 
 
 logger = get_logger(__name__)
@@ -77,6 +79,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--train_limit", type=int, default=None, help="Optional manifest row limit for smoke runs.")
     parser.add_argument("--enable_slicing", action="store_true")
     parser.add_argument("--enable_tiling", action="store_true")
+    parser.add_argument("--trajectory_hidden_dim", type=int, default=256)
+    parser.add_argument("--trajectory_dropout", type=float, default=0.0)
+    parser.add_argument("--trajectory_loss_weight", type=float, default=1.0)
+    parser.add_argument("--disable_trajectory_head", action="store_true")
     return parser.parse_args()
 
 
@@ -138,9 +144,17 @@ def unwrap_model(accelerator: Accelerator, model: torch.nn.Module) -> torch.nn.M
     return model._orig_mod if is_compiled_module(model) else model
 
 
+def checkpoint_step(path: Path) -> Optional[int]:
+    try:
+        return int(path.name.split("-")[-1])
+    except ValueError:
+        return None
+
+
 def save_checkpoint(
     accelerator: Accelerator,
     transformer: torch.nn.Module,
+    trajectory_head: Optional[torch.nn.Module],
     args: argparse.Namespace,
     output_dir: str,
     global_step: int,
@@ -150,8 +164,8 @@ def save_checkpoint(
 
     if args.checkpoints_total_limit is not None:
         checkpoints = sorted(
-            [p for p in Path(args.output_dir).glob("checkpoint-*") if p.is_dir()],
-            key=lambda p: int(p.name.split("-")[-1]),
+            [p for p in Path(args.output_dir).glob("checkpoint-*") if p.is_dir() and checkpoint_step(p) is not None],
+            key=lambda p: checkpoint_step(p) or -1,
         )
         if len(checkpoints) >= args.checkpoints_total_limit:
             for path in checkpoints[: len(checkpoints) - args.checkpoints_total_limit + 1]:
@@ -162,6 +176,8 @@ def save_checkpoint(
     save_path = Path(output_dir) / f"checkpoint-{global_step}"
     save_path.mkdir(parents=True, exist_ok=True)
     unwrap_model(accelerator, transformer).save_pretrained(save_path / "transformer")
+    if trajectory_head is not None:
+        unwrap_model(accelerator, trajectory_head).save_checkpoint(save_path)
     with (save_path / "training_args.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, sort_keys=True)
     logger.info(f"Saved checkpoint to {save_path}")
@@ -195,6 +211,25 @@ def make_dataloader(args: argparse.Namespace, accelerator: Accelerator) -> DataL
         collate_fn=surgwmbench_anchor_collate,
         persistent_workers=args.dataloader_num_workers > 0,
     )
+
+
+def load_checkpoint_weights(
+    accelerator: Accelerator,
+    transformer: torch.nn.Module,
+    trajectory_head: Optional[torch.nn.Module],
+    checkpoint: Path,
+    torch_dtype: torch.dtype,
+) -> None:
+    transformer_path = checkpoint / "transformer"
+    if transformer_path.is_dir():
+        loaded_transformer = CogVideoXTransformer3DModel.from_pretrained(transformer_path, torch_dtype=torch_dtype)
+        unwrap_model(accelerator, transformer).load_state_dict(loaded_transformer.state_dict())
+        del loaded_transformer
+
+    trajectory_path = checkpoint / "trajectory_head.pt"
+    if trajectory_head is not None and trajectory_path.exists():
+        loaded_head = SurgWMBenchTrajectoryHead.from_checkpoint(checkpoint)
+        unwrap_model(accelerator, trajectory_head).load_state_dict(loaded_head.state_dict())
 
 
 def main(args: argparse.Namespace) -> None:
@@ -274,7 +309,23 @@ def main(args: argparse.Namespace) -> None:
     if args.mixed_precision == "fp16":
         cast_training_params([transformer], dtype=torch.float32)
 
+    trajectory_head: Optional[SurgWMBenchTrajectoryHead] = None
+    if not args.disable_trajectory_head:
+        latent_channels = getattr(transformer.config, "in_channels", getattr(vae.config, "latent_channels", 16))
+        trajectory_head = SurgWMBenchTrajectoryHead(
+            latent_channels=latent_channels,
+            context_anchors=args.context_anchors,
+            prediction_anchors=args.prediction_anchors,
+            hidden_dim=args.trajectory_hidden_dim,
+            dropout=args.trajectory_dropout,
+        )
+        trajectory_head.to(accelerator.device, dtype=weight_dtype)
+        if args.mixed_precision == "fp16":
+            cast_training_params([trajectory_head], dtype=torch.float32)
+
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    if trajectory_head is not None:
+        trainable_params.extend(trajectory_head.parameters())
     num_trainable_params = sum(p.numel() for p in trainable_params)
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -298,10 +349,17 @@ def main(args: argparse.Namespace) -> None:
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        transformer, optimizer, train_dataloader, lr_scheduler
-    )
+    if trajectory_head is not None:
+        transformer, trajectory_head, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, trajectory_head, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
     trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+    if trajectory_head is not None:
+        trainable_params.extend(trajectory_head.parameters())
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -329,13 +387,20 @@ def main(args: argparse.Namespace) -> None:
         resume_path = args.resume_from_checkpoint
         if resume_path == "latest":
             checkpoints = sorted(
-                [p for p in Path(args.output_dir).glob("checkpoint-*") if p.is_dir()],
-                key=lambda p: int(p.name.split("-")[-1]),
+                [p for p in Path(args.output_dir).glob("checkpoint-*") if p.is_dir() and checkpoint_step(p) is not None],
+                key=lambda p: checkpoint_step(p) or -1,
             )
             resume_path = str(checkpoints[-1]) if checkpoints else None
         if resume_path:
-            accelerator.load_state(resume_path)
-            global_step = int(Path(resume_path).name.split("-")[-1])
+            resume_checkpoint = Path(resume_path)
+            try:
+                accelerator.load_state(resume_path)
+            except Exception as exc:
+                logger.warning(f"Could not load full accelerator state from {resume_path}: {exc}")
+                load_checkpoint_weights(accelerator, transformer, trajectory_head, resume_checkpoint, weight_dtype)
+            else:
+                load_checkpoint_weights(accelerator, transformer, trajectory_head, resume_checkpoint, weight_dtype)
+            global_step = checkpoint_step(Path(resume_path)) or 0
             first_epoch = global_step // num_update_steps_per_epoch
 
     progress_bar = tqdm(
@@ -348,11 +413,14 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
+        if trajectory_head is not None:
+            trajectory_head.train()
         if hasattr(train_dataloader.sampler, "set_epoch"):
             train_dataloader.sampler.set_epoch(epoch)
 
         for batch in train_dataloader:
-            with accelerator.accumulate(transformer):
+            accumulate_models = (transformer, trajectory_head) if trajectory_head is not None else (transformer,)
+            with accelerator.accumulate(*accumulate_models):
                 video = pad_anchor_video(batch["anchor_frames"], args.model_num_frames)
                 video = video.to(device=accelerator.device, dtype=torch.float32)
                 latents = encode_video_latents(vae, video).to(dtype=weight_dtype).permute(0, 2, 1, 3, 4)
@@ -403,7 +471,23 @@ def main(args: argparse.Namespace) -> None:
                 loss_mask[:, context_latent_frames:valid_latent_frames] = 1
                 loss_values = weights * (model_pred - latents) ** 2 * loss_mask
                 denom = loss_mask.sum() * batch_size * channels * latent_height * latent_width
-                loss = loss_values.sum() / denom.clamp_min(1)
+                image_loss = loss_values.sum() / denom.clamp_min(1)
+
+                trajectory_loss = None
+                loss = image_loss
+                if trajectory_head is not None:
+                    trajectory_context_video = pad_anchor_video(batch["context_frames"], args.model_num_frames)
+                    trajectory_context_video = trajectory_context_video.to(device=accelerator.device, dtype=torch.float32)
+                    trajectory_context_latents = (
+                        encode_video_latents(vae, trajectory_context_video)
+                        .to(dtype=weight_dtype)
+                        .permute(0, 2, 1, 3, 4)[:, :context_latent_frames]
+                    )
+                    context_coords_norm = batch["context_coords_norm"].to(device=accelerator.device, dtype=weight_dtype)
+                    target_coords_norm = batch["target_coords_norm"].to(device=accelerator.device, dtype=weight_dtype)
+                    pred_coords_norm = trajectory_head(trajectory_context_latents, context_coords_norm)
+                    trajectory_loss = F.smooth_l1_loss(pred_coords_norm.float(), target_coords_norm.float())
+                    loss = image_loss + args.trajectory_loss_weight * trajectory_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -415,12 +499,18 @@ def main(args: argparse.Namespace) -> None:
             if accelerator.sync_gradients:
                 global_step += 1
                 progress_bar.update(1)
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {
+                    "loss": loss.detach().item(),
+                    "image_loss": image_loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }
+                if trajectory_loss is not None:
+                    logs["trajectory_loss"] = trajectory_loss.detach().item()
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
                 if global_step % args.checkpointing_steps == 0:
-                    save_checkpoint(accelerator, transformer, args, args.output_dir, global_step)
+                    save_checkpoint(accelerator, transformer, trajectory_head, args, args.output_dir, global_step)
 
             if global_step >= args.max_train_steps:
                 break
@@ -433,6 +523,8 @@ def main(args: argparse.Namespace) -> None:
         final_dir = Path(args.output_dir) / "checkpoint-final"
         final_dir.mkdir(parents=True, exist_ok=True)
         unwrap_model(accelerator, transformer).save_pretrained(final_dir / "transformer")
+        if trajectory_head is not None:
+            unwrap_model(accelerator, trajectory_head).save_checkpoint(final_dir)
         with (final_dir / "training_args.json").open("w", encoding="utf-8") as f:
             json.dump(vars(args), f, indent=2, sort_keys=True)
         logger.info(f"Saved final checkpoint to {final_dir}")

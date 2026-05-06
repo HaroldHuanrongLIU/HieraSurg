@@ -116,19 +116,41 @@ class SurgWMBenchAnchorDataset(Dataset):
         with Image.open(_resolve_path(self.dataset_root, relative_path)) as image:
             return self.transform(image.convert("RGB"))
 
+    @staticmethod
+    def _anchor_coords(records: Sequence[Dict[str, Any]], field: str) -> torch.Tensor:
+        coords = []
+        for frame in records:
+            coord = frame.get(field)
+            if coord is None:
+                raise ValueError(f"Missing {field} for anchor frame {frame.get('local_frame_idx')}")
+            coords.append(coord)
+        return torch.tensor(coords, dtype=torch.float32)
+
     def __getitem__(self, index: int) -> Dict[str, Any]:
         row = self.rows[index]
         annotation, anchor_records = self._anchor_frame_records(row)
         selected_records = anchor_records[: self.required_anchors]
         anchor_frames = torch.stack([self._load_frame(frame["frame_path"]) for frame in selected_records], dim=1)
+        anchor_coords_norm = self._anchor_coords(selected_records, "human_coord_norm")
+        anchor_coords_px = self._anchor_coords(selected_records, "human_coord_px")
 
         context_frames = anchor_frames[:, : self.context_anchors]
         target_frames = anchor_frames[:, self.context_anchors : self.required_anchors]
+        context_coords_norm = anchor_coords_norm[: self.context_anchors]
+        target_coords_norm = anchor_coords_norm[self.context_anchors : self.required_anchors]
+        context_coords_px = anchor_coords_px[: self.context_anchors]
+        target_coords_px = anchor_coords_px[self.context_anchors : self.required_anchors]
 
         return {
             "anchor_frames": anchor_frames,
             "context_frames": context_frames,
             "target_frames": target_frames,
+            "anchor_coords_norm": anchor_coords_norm,
+            "context_coords_norm": context_coords_norm,
+            "target_coords_norm": target_coords_norm,
+            "anchor_coords_px": anchor_coords_px,
+            "context_coords_px": context_coords_px,
+            "target_coords_px": target_coords_px,
             "sampled_indices": list(row["sampled_indices"]),
             "anchor_frame_paths": [frame["frame_path"] for frame in selected_records],
             "context_frame_paths": [frame["frame_path"] for frame in selected_records[: self.context_anchors]],
@@ -163,7 +185,17 @@ def latent_frame_count(num_frames: int, temporal_compression_ratio: int) -> int:
 
 
 def surgwmbench_anchor_collate(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    tensor_keys = ("anchor_frames", "context_frames", "target_frames")
+    tensor_keys = (
+        "anchor_frames",
+        "context_frames",
+        "target_frames",
+        "anchor_coords_norm",
+        "context_coords_norm",
+        "target_coords_norm",
+        "anchor_coords_px",
+        "context_coords_px",
+        "target_coords_px",
+    )
     out: Dict[str, Any] = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
 
     metadata_keys = [
