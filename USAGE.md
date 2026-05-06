@@ -44,7 +44,10 @@ uv run python src/tools/validate_surgwmbench_anchor_loader.py \
 Use this mode when the input contains anchors 1-5 images and their trajectory
 points. The image branch predicts anchors 6-20, and the trajectory head predicts
 future points 6-20. The saved checkpoint includes both `transformer/` and
-`trajectory_head.pt`.
+`trajectory_head.pt`. By default, robust trajectory conditioning is enabled:
+input trajectory points receive normalized Gaussian noise with std `0.01`, and
+each context point is randomly masked with probability `0.15`. Set both values
+to `0` for clean trajectory inputs.
 
 Single-GPU command:
 
@@ -63,6 +66,8 @@ uv run accelerate launch --num_processes 1 \
   --mixed_precision bf16 \
   --gradient_checkpointing \
   --trajectory_loss_weight 1.0 \
+  --trajectory_coord_noise_std 0.01 \
+  --trajectory_coord_mask_prob 0.15 \
   --enable_slicing \
   --enable_tiling
 ```
@@ -84,6 +89,8 @@ uv run accelerate launch --multi_gpu --num_processes 4 \
   --mixed_precision bf16 \
   --gradient_checkpointing \
   --trajectory_loss_weight 1.0 \
+  --trajectory_coord_noise_std 0.01 \
+  --trajectory_coord_mask_prob 0.15 \
   --enable_slicing \
   --enable_tiling
 ```
@@ -102,6 +109,8 @@ uv run accelerate launch --multi_gpu --num_processes 4 \
   --mixed_precision bf16 \
   --gradient_checkpointing \
   --trajectory_loss_weight 1.0 \
+  --trajectory_coord_noise_std 0.01 \
+  --trajectory_coord_mask_prob 0.15 \
   --enable_slicing \
   --enable_tiling
 ```
@@ -111,6 +120,18 @@ For a quick smoke run, append:
 ```bash
 --train_limit 2 --max_train_steps 1
 ```
+
+Disable robust trajectory conditioning while keeping joint image + trajectory
+training enabled:
+
+```bash
+--trajectory_coord_noise_std 0.0 \
+--trajectory_coord_mask_prob 0.0
+```
+
+This keeps the trajectory head active, but uses the clean context trajectory
+points without Gaussian noise or random masking. Do not confuse this with
+`--disable_trajectory_head`, which switches to the image-only baseline.
 
 ## Image-Only Training
 

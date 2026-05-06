@@ -83,6 +83,18 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--trajectory_dropout", type=float, default=0.0)
     parser.add_argument("--trajectory_loss_weight", type=float, default=1.0)
     parser.add_argument("--disable_trajectory_head", action="store_true")
+    parser.add_argument(
+        "--trajectory_coord_noise_std",
+        type=float,
+        default=0.01,
+        help="Gaussian noise std for normalized context trajectory coordinates during joint training.",
+    )
+    parser.add_argument(
+        "--trajectory_coord_mask_prob",
+        type=float,
+        default=0.15,
+        help="Per-context-point random masking probability for trajectory coordinates during joint training.",
+    )
     return parser.parse_args()
 
 
@@ -232,6 +244,28 @@ def load_checkpoint_weights(
         unwrap_model(accelerator, trajectory_head).load_state_dict(loaded_head.state_dict())
 
 
+def augment_context_coords(
+    context_coords_norm: torch.Tensor,
+    noise_std: float,
+    mask_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if noise_std < 0:
+        raise ValueError("--trajectory_coord_noise_std must be non-negative.")
+    if mask_prob < 0 or mask_prob > 1:
+        raise ValueError("--trajectory_coord_mask_prob must be in [0, 1].")
+
+    coords = context_coords_norm
+    if noise_std > 0:
+        coords = coords + torch.randn_like(coords) * noise_std
+        coords = coords.clamp(0, 1)
+
+    mask = torch.ones(coords.shape[:2], device=coords.device, dtype=coords.dtype)
+    if mask_prob > 0:
+        mask = (torch.rand(coords.shape[:2], device=coords.device) >= mask_prob).to(dtype=coords.dtype)
+    coords = coords * mask.unsqueeze(-1)
+    return coords, mask
+
+
 def main(args: argparse.Namespace) -> None:
     if args.context_anchors + args.prediction_anchors != 20:
         raise ValueError("This task expects 5 context anchors plus 15 prediction anchors, totaling 20 anchors.")
@@ -239,6 +273,10 @@ def main(args: argparse.Namespace) -> None:
         raise ValueError("--model-num-frames must be at least 20.")
     if (args.model_num_frames - 1) % 4 != 0:
         raise ValueError("--model-num-frames should satisfy (N - 1) % 4 == 0 for CogVideoX temporal compression.")
+    if args.trajectory_coord_noise_std < 0:
+        raise ValueError("--trajectory_coord_noise_std must be non-negative.")
+    if args.trajectory_coord_mask_prob < 0 or args.trajectory_coord_mask_prob > 1:
+        raise ValueError("--trajectory_coord_mask_prob must be in [0, 1].")
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -380,6 +418,9 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"  Num trainable parameters = {num_trainable_params}")
     logger.info(f"  Context latent frames = {context_latent_frames}")
     logger.info(f"  Valid latent frames = {valid_latent_frames}")
+    if trajectory_head is not None:
+        logger.info(f"  Trajectory coord noise std = {args.trajectory_coord_noise_std}")
+        logger.info(f"  Trajectory coord mask prob = {args.trajectory_coord_mask_prob}")
 
     global_step = 0
     first_epoch = 0
@@ -485,7 +526,16 @@ def main(args: argparse.Namespace) -> None:
                     )
                     context_coords_norm = batch["context_coords_norm"].to(device=accelerator.device, dtype=weight_dtype)
                     target_coords_norm = batch["target_coords_norm"].to(device=accelerator.device, dtype=weight_dtype)
-                    pred_coords_norm = trajectory_head(trajectory_context_latents, context_coords_norm)
+                    context_coords_aug, context_coord_mask = augment_context_coords(
+                        context_coords_norm,
+                        args.trajectory_coord_noise_std,
+                        args.trajectory_coord_mask_prob,
+                    )
+                    pred_coords_norm = trajectory_head(
+                        trajectory_context_latents,
+                        context_coords_aug,
+                        context_coord_mask,
+                    )
                     trajectory_loss = F.smooth_l1_loss(pred_coords_norm.float(), target_coords_norm.float())
                     loss = image_loss + args.trajectory_loss_weight * trajectory_loss
 
@@ -506,6 +556,7 @@ def main(args: argparse.Namespace) -> None:
                 }
                 if trajectory_loss is not None:
                     logs["trajectory_loss"] = trajectory_loss.detach().item()
+                    logs["trajectory_coord_keep_ratio"] = context_coord_mask.detach().float().mean().item()
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 

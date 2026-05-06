@@ -124,7 +124,9 @@ uv run accelerate launch src/finetune/train_surgwmbench_anchor_i2v.py \
   --val-manifest manifests/val.jsonl \
   --pretrained_model_name_or_path /path/to/cogvideox-or-hierasurg-base \
   --output_dir outputs/surgwmbench_anchor_i2v \
-  --trajectory_loss_weight 1.0
+  --trajectory_loss_weight 1.0 \
+  --trajectory_coord_noise_std 0.01 \
+  --trajectory_coord_mask_prob 0.15
 ```
 
 For an image-only baseline, add `--disable_trajectory_head`; this skips trajectory-head construction, trajectory loss,

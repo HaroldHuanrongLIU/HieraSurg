@@ -44,6 +44,33 @@ def test_trajectory_head_predicts_future_coords():
     assert torch.all(prediction <= 1)
 
 
+def test_trajectory_head_accepts_context_coord_mask():
+    head = SurgWMBenchTrajectoryHead(
+        latent_channels=16,
+        context_anchors=5,
+        prediction_anchors=15,
+        hidden_dim=32,
+    )
+    latents = torch.randn(2, 2, 16, 4, 4)
+    context_coords = torch.rand(2, 5, 2)
+    context_mask = torch.tensor([[1, 1, 0, 1, 0], [1, 0, 0, 1, 1]], dtype=torch.float32)
+    prediction = head(latents, context_coords, context_mask)
+    assert prediction.shape == (2, 15, 2)
+    assert torch.all(prediction >= 0)
+    assert torch.all(prediction <= 1)
+
+
+def test_trajectory_head_loads_legacy_coord_condition_checkpoint(tmp_path):
+    head = SurgWMBenchTrajectoryHead(latent_channels=8, hidden_dim=16, coord_condition_dim=10)
+    head.save_checkpoint(tmp_path)
+    payload_path = tmp_path / "trajectory_head.pt"
+    payload = torch.load(payload_path, weights_only=False)
+    payload["config"].pop("coord_condition_dim")
+    torch.save(payload, payload_path)
+    loaded = SurgWMBenchTrajectoryHead.from_checkpoint(tmp_path)
+    assert loaded.coord_condition_dim == 10
+
+
 def test_trajectory_head_checkpoint_round_trip(tmp_path):
     head = SurgWMBenchTrajectoryHead(latent_channels=8, hidden_dim=16)
     head.save_checkpoint(tmp_path)
