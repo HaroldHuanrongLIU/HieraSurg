@@ -51,7 +51,44 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--max-videos", type=int, default=8)
     parser.add_argument("--enable_slicing", action="store_true")
     parser.add_argument("--enable_tiling", action="store_true")
+    parser.add_argument(
+        "--inference-coord-noise-std",
+        type=float,
+        default=0.0,
+        help="Gaussian noise std applied to normalized context coords at inference (trajectory head only).",
+    )
+    parser.add_argument(
+        "--inference-coord-mask-prob",
+        type=float,
+        default=0.0,
+        help="Per-context-point random mask probability applied at inference (trajectory head only).",
+    )
     return parser.parse_args()
+
+
+def augment_context_coords(
+    context_coords_norm: torch.Tensor,
+    noise_std: float,
+    mask_prob: float,
+    generator: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if noise_std < 0:
+        raise ValueError("--inference-coord-noise-std must be non-negative.")
+    if mask_prob < 0 or mask_prob > 1:
+        raise ValueError("--inference-coord-mask-prob must be in [0, 1].")
+
+    coords = context_coords_norm
+    if noise_std > 0:
+        noise = torch.randn(coords.shape, generator=generator, device=coords.device, dtype=coords.dtype)
+        coords = coords + noise * noise_std
+        coords = coords.clamp(0, 1)
+
+    mask = torch.ones(coords.shape[:2], device=coords.device, dtype=coords.dtype)
+    if mask_prob > 0:
+        rand = torch.rand(coords.shape[:2], generator=generator, device=coords.device, dtype=coords.dtype)
+        mask = (rand >= mask_prob).to(dtype=coords.dtype)
+    coords = coords * mask.unsqueeze(-1)
+    return coords, mask
 
 
 def transformer_checkpoint_path(checkpoint: str) -> Path:
@@ -406,8 +443,16 @@ def main() -> None:
         if trajectory_head is not None:
             context_latents = encode_padded_context_latents(vae, context_frames, args, device, dtype)
             context_coords_norm = batch["context_coords_norm"].to(device=device, dtype=dtype)
+            context_coords_aug, context_coord_mask = augment_context_coords(
+                context_coords_norm,
+                args.inference_coord_noise_std,
+                args.inference_coord_mask_prob,
+                generator=generator,
+            )
             with torch.no_grad():
-                pred_future_coords_norm = trajectory_head(context_latents, context_coords_norm).float().cpu()
+                pred_future_coords_norm = trajectory_head(
+                    context_latents, context_coords_aug, context_coord_mask
+                ).float().cpu()
 
         for b in range(pred_targets.shape[0]):
             original_size = batch["original_size"][b]
@@ -502,6 +547,8 @@ def main() -> None:
         "eval_horizons": args.eval_horizons,
         "metric_resolution": "original",
         "generated_resolution": [args.height, args.width],
+        "inference_coord_noise_std": args.inference_coord_noise_std,
+        "inference_coord_mask_prob": args.inference_coord_mask_prob,
         "metrics": aggregate_metrics,
         "lpips_available": lpips_model is not None,
         "num_samples": len(samples),
